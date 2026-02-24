@@ -5,4 +5,3 @@ __pycache__/
 *.pyc
 *.pth
 *.bin
-BestModel/best_model.pt
