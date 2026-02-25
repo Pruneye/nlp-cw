@@ -26,10 +26,10 @@ np.random.seed(SEED)
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL_NAME      = "microsoft/deberta-v3-large"
 MAX_LENGTH      = 128
-BATCH_SIZE      = 16
-EPOCHS          = 12
-LR              = 6e-6
-LLRD_DECAY      = 0.9    # multiplicative LR decay per layer (PALI-NLP strategy)
+BATCH_SIZE      = 8
+GRAD_ACCUM      = 2
+EPOCHS          = 10
+LR              = 8e-6
 WARMUP_RATIO    = 0.1
 WEIGHT_DECAY    = 0.01
 FOCAL_GAMMA     = 2.0
@@ -103,54 +103,6 @@ class FGM:
         self.backup = {}
 
 
-# ── Grouped Layer-wise LR Decay (PALI-NLP) ───────────────────────────────────
-def get_grouped_params(model, lr, weight_decay, decay_rate=0.9):
-    """
-    Grouped LLRD: embeddings get lowest LR, each successive layer gets
-    higher LR by decay_rate, classifier/pooler get full LR.
-    From PALI-NLP 1st place system at SemEval-2022 Task 4.
-    """
-    no_decay = ['bias', 'LayerNorm.weight']
-    params   = []
-
-    # Embeddings — lowest LR
-    emb_lr = lr * (decay_rate ** 24)
-    params += [
-        {'params': [p for n, p in model.named_parameters()
-                    if 'embeddings' in n and not any(nd in n for nd in no_decay)],
-         'lr': emb_lr, 'weight_decay': weight_decay},
-        {'params': [p for n, p in model.named_parameters()
-                    if 'embeddings' in n and any(nd in n for nd in no_decay)],
-         'lr': emb_lr, 'weight_decay': 0.0},
-    ]
-
-    # Transformer layers — progressively higher LR
-    for layer_num in range(24):
-        layer_lr = lr * (decay_rate ** (24 - layer_num))
-        params += [
-            {'params': [p for n, p in model.named_parameters()
-                        if f'layer.{layer_num}.' in n and not any(nd in n for nd in no_decay)],
-             'lr': layer_lr, 'weight_decay': weight_decay},
-            {'params': [p for n, p in model.named_parameters()
-                        if f'layer.{layer_num}.' in n and any(nd in n for nd in no_decay)],
-             'lr': layer_lr, 'weight_decay': 0.0},
-        ]
-
-    # Classifier and pooler — full LR
-    params += [
-        {'params': [p for n, p in model.named_parameters()
-                    if any(x in n for x in ['classifier', 'pooler'])
-                    and not any(nd in n for nd in no_decay)],
-         'lr': lr, 'weight_decay': weight_decay},
-        {'params': [p for n, p in model.named_parameters()
-                    if any(x in n for x in ['classifier', 'pooler'])
-                    and any(nd in n for nd in no_decay)],
-         'lr': lr, 'weight_decay': 0.0},
-    ]
-
-    return params
-
-
 # ── Data Loading ──────────────────────────────────────────────────────────────
 def load_data():
     dpm = DontPatronizeMe(DATA_DIR, os.path.join(DATA_DIR, 'task4_test.tsv'))
@@ -167,6 +119,7 @@ def load_data():
     full_df['par_id']   = full_df['par_id'].astype(str).str.strip()
 
     train_df = full_df[full_df['par_id'].isin(train_ids['par_id'])].reset_index(drop=True)
+    # Preserve dev order to match predictions row-by-row
     dev_df   = dev_ids[['par_id']].merge(full_df, on='par_id', how='left').reset_index(drop=True)
     test_df  = dpm.test_set_df
 
@@ -246,7 +199,7 @@ def train_epoch(model, loader, optimiser, scheduler, loss_fn, fgm, scaler):
     total_loss = 0
     optimiser.zero_grad()
 
-    for batch in tqdm(loader, desc='Training'):
+    for i, batch in enumerate(tqdm(loader, desc='Training')):
         input_ids      = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         labels         = batch['labels'].to(device)
@@ -265,14 +218,15 @@ def train_epoch(model, loader, optimiser, scheduler, loss_fn, fgm, scaler):
         scaler.scale(adv_loss).backward()
         fgm.restore()
 
-        scaler.unscale_(optimiser)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimiser)
-        scaler.update()
-        scheduler.step()
-        optimiser.zero_grad()
+        if (i + 1) % GRAD_ACCUM == 0:
+            scaler.unscale_(optimiser)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimiser)
+            scaler.update()
+            scheduler.step()
+            optimiser.zero_grad()
 
-        total_loss += loss.item()
+        total_loss += loss.item() * GRAD_ACCUM
 
     return total_loss / len(loader)
 
@@ -341,23 +295,19 @@ def main():
     dev_dataset   = PCLDataset(dev_df['text'],   dev_df['label'],   tokenizer, MAX_LENGTH)
     test_dataset  = PCLTestDataset(test_df['text'], tokenizer, MAX_LENGTH)
 
-    # Weighted Random Sampler — oversample minority PCL class (PALI-NLP strategy)
-    class_weights    = compute_class_weights(train_df['label'].values)
-    sample_weights   = [class_weights[label].item() for label in train_df['label'].values]
-    sampler          = torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights))
-    train_loader     = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=sampler, num_workers=2, pin_memory=True)
-    dev_loader       = DataLoader(dev_dataset,   batch_size=BATCH_SIZE, shuffle=False,   num_workers=2, pin_memory=True)
-    test_loader      = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False,   num_workers=2, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,  num_workers=2, pin_memory=True)
+    dev_loader   = DataLoader(dev_dataset,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+    test_loader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
 
     model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=2)
     model.to(device)
     scaler = torch.cuda.amp.GradScaler()
 
-    loss_fn = FocalLoss(alpha=class_weights, gamma=FOCAL_GAMMA, label_smoothing=LABEL_SMOOTHING)
-    fgm     = FGM(model, epsilon=FGM_EPSILON)
+    class_weights = compute_class_weights(train_df['label'].values)
+    loss_fn       = FocalLoss(alpha=class_weights, gamma=FOCAL_GAMMA, label_smoothing=LABEL_SMOOTHING)
+    fgm           = FGM(model, epsilon=FGM_EPSILON)
 
-    # Grouped LLRD optimiser (PALI-NLP strategy)
-    optimiser    = AdamW(get_grouped_params(model, LR, WEIGHT_DECAY, LLRD_DECAY), lr=LR)
+    optimiser    = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     total_steps  = len(train_loader) * EPOCHS
     warmup_steps = int(total_steps * WARMUP_RATIO)
     scheduler    = get_cosine_schedule_with_warmup(optimiser, warmup_steps, total_steps)
@@ -409,7 +359,7 @@ def main():
         write_header = not os.path.exists(METRICS_PATH)
         metrics_df.to_csv(METRICS_PATH, mode='a', header=write_header, index=False)
 
-        # Save checkpoint
+        # Save single rolling checkpoint
         save_checkpoint(epoch + 1, model, optimiser, scheduler, scaler, best_f1, best_threshold)
 
     print(f"\nFinal best dev F1: {best_f1:.4f} at threshold {best_threshold:.2f}")
