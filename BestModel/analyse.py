@@ -1,4 +1,5 @@
 import os
+import ast
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -10,19 +11,23 @@ from sklearn.metrics import (
 )
 
 # ── Config ───────────────────────────────────────────────────────────────────
-DATA_DIR        = "../data"
-PRED_DIR        = "../predictions"
-OUTPUT_DIR      = "../eda"
+BASE_DIR        = os.path.dirname(__file__)
+DATA_DIR        = os.path.join(BASE_DIR, "..", "data")
+PRED_DIR        = os.path.join(BASE_DIR, "..", "predictions")
+OUTPUT_DIR      = os.path.join(BASE_DIR, "..", "eda")
 BASELINE_F1     = 0.48          # RoBERTa baseline from the paper
-OUR_DEV_F1      = 0.5944        # confirmed via evaluation.py
-THRESHOLD       = 0.50          # best threshold from training
+THRESHOLD       = 0.50          # nominal threshold used for plots
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ── Load Data ─────────────────────────────────────────────────────────────────
 def load_dev_with_predictions():
-    # Load full dataset
+    """
+    Load dev set + our latest predictions, using the *official* SemEval
+    binarisation (>=2 annotators in the CSV vote labels).
+    """
+    # Load full TSV (for text / keyword / etc.)
     df = pd.read_csv(
         os.path.join(DATA_DIR, "dontpatronizeme_pcl.tsv"),
         sep="\t",
@@ -30,19 +35,21 @@ def load_dev_with_predictions():
         names=["par_id", "art_id", "keyword", "country", "text", "label"],
         skiprows=4
     )
-    df["par_id"]       = df["par_id"].astype(str).str.strip()
-    df["binary_label"] = (df["label"] >= 2).astype(int)
-    df["token_count"]  = df["text"].str.split().str.len()
+    df["par_id"]      = df["par_id"].astype(str).str.strip()
+    df["token_count"] = df["text"].str.split().str.len()
 
-    # Load dev split IDs
+    # Load dev split IDs + vote vectors and reproduce evaluation.py / train.py logic
     dev_ids = pd.read_csv(os.path.join(DATA_DIR, "dev_semeval_parids-labels.csv"))
     dev_ids["par_id"] = dev_ids["par_id"].astype(str).str.strip()
+    dev_ids["binary_label"] = dev_ids["label"].apply(
+        lambda x: 1 if sum(ast.literal_eval(x)) >= 2 else 0
+    )
 
-    # Filter to dev set in order
+    # Filter to dev set and then merge in CSV order so we stay aligned with predictions
     dev_df = df[df["par_id"].isin(dev_ids["par_id"])].copy()
-
-    # Merge to preserve the CSV ordering (important — predictions align row-by-row)
-    dev_df = dev_ids[["par_id"]].merge(dev_df, on="par_id", how="left")
+    dev_df = dev_ids[["par_id", "binary_label"]].merge(
+        dev_df.drop(columns=["label"]), on="par_id", how="left"
+    )
 
     # Load our predictions
     with open(os.path.join(PRED_DIR, "dev.txt")) as f:
@@ -59,7 +66,7 @@ def load_dev_with_predictions():
 
 
 # ── Section 1: Confusion Matrix ───────────────────────────────────────────────
-def plot_confusion_matrix(dev_df):
+def plot_confusion_matrix(dev_df, overall_f1):
     cm   = confusion_matrix(dev_df["binary_label"], dev_df["pred"])
     disp = ConfusionMatrixDisplay(cm, display_labels=["No PCL", "PCL"])
 
@@ -76,7 +83,7 @@ def plot_confusion_matrix(dev_df):
     print(f"\nTP={tp}  FP={fp}  FN={fn}  TN={tn}")
     print(f"Precision : {tp / (tp + fp):.4f}")
     print(f"Recall    : {tp / (tp + fn):.4f}")
-    print(f"F1        : {OUR_DEV_F1:.4f}  (baseline {BASELINE_F1})")
+    print(f"F1        : {overall_f1:.4f}  (baseline {BASELINE_F1})")
     return tp, fp, fn, tn
 
 
@@ -121,7 +128,7 @@ def plot_pr_curve(dev_df):
 
 
 # ── Section 3: Performance by Keyword Category ────────────────────────────────
-def analyse_by_keyword(dev_df):
+def analyse_by_keyword(dev_df, overall_f1):
     results = []
     for kw, group in dev_df.groupby("keyword"):
         total   = len(group)
@@ -148,10 +155,10 @@ def analyse_by_keyword(dev_df):
 
     # Plot
     fig, ax = plt.subplots(figsize=(10, 5))
-    colors = ["#d62728" if f < OUR_DEV_F1 else "#2ca02c" for f in kw_df["f1"]]
+    colors = ["#d62728" if f < overall_f1 else "#2ca02c" for f in kw_df["f1"]]
     ax.barh(kw_df["keyword"], kw_df["f1"], color=colors)
-    ax.axvline(OUR_DEV_F1,   color="black",  lw=1.5, linestyle="--",
-               label=f"Overall F1={OUR_DEV_F1}")
+    ax.axvline(overall_f1,   color="black",  lw=1.5, linestyle="--",
+               label=f"Overall F1={overall_f1:.3f}")
     ax.axvline(BASELINE_F1,  color="red",    lw=1.5, linestyle=":",
                label=f"Baseline F1={BASELINE_F1}")
     ax.set_xlabel("F1 Score (PCL class)")
@@ -242,13 +249,16 @@ def main():
     print("Loading dev set with predictions...")
     dev_df = load_dev_with_predictions()
 
+    # Compute current F1 from latest predictions vs official dev labels
+    overall_f1 = f1_score(dev_df["binary_label"], dev_df["pred"])
+
     print(f"\nDev set: {len(dev_df)} samples | PCL: {dev_df['binary_label'].sum()}")
-    print(f"Our F1: {OUR_DEV_F1}  |  Baseline F1: {BASELINE_F1}\n")
+    print(f"Our F1: {overall_f1:.4f}  |  Baseline F1: {BASELINE_F1}\n")
 
     print("=" * 60)
     print("1. Confusion Matrix")
     print("=" * 60)
-    plot_confusion_matrix(dev_df)
+    plot_confusion_matrix(dev_df, overall_f1)
 
     print("\n" + "=" * 60)
     print("2. Precision-Recall Curve")
@@ -258,7 +268,7 @@ def main():
     print("\n" + "=" * 60)
     print("3. Performance by Keyword")
     print("=" * 60)
-    kw_df = analyse_by_keyword(dev_df)
+    kw_df = analyse_by_keyword(dev_df, overall_f1)
 
     print("\n" + "=" * 60)
     print("4. Token Length vs Error Rate")
