@@ -2,6 +2,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+import ast
 import pandas as pd
 import numpy as np
 import torch
@@ -48,11 +49,6 @@ print(f"Using device: {device}")
 
 # ── Focal Loss ────────────────────────────────────────────────────────────────
 class FocalLoss(nn.Module):
-    """
-    Focal Loss for binary classification with class imbalance.
-    Down-weights easy examples so the model focuses on hard ones.
-    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
-    """
     def __init__(self, alpha, gamma=2.0, label_smoothing=0.0):
         super().__init__()
         self.alpha           = alpha
@@ -77,10 +73,6 @@ class FocalLoss(nn.Module):
 
 # ── FGM Adversarial Training ──────────────────────────────────────────────────
 class FGM:
-    """
-    Fast Gradient Method adversarial training.
-    Perturbs word embeddings to improve robustness.
-    """
     def __init__(self, model, epsilon=0.5):
         self.model   = model
         self.epsilon = epsilon
@@ -109,19 +101,29 @@ def load_data():
     dpm.load_task1()
     dpm.load_test()
 
-    full_df = dpm.train_task1_df
+    full_df = dpm.train_task1_df.copy()
+    full_df['par_id'] = full_df['par_id'].astype(str).str.strip()
 
+    # ── Train: use DPM binary labels, TSV order is fine ──────────────────────
     train_ids = pd.read_csv(os.path.join(DATA_DIR, 'train_semeval_parids-labels.csv'))
-    dev_ids   = pd.read_csv(os.path.join(DATA_DIR, 'dev_semeval_parids-labels.csv'))
-
     train_ids['par_id'] = train_ids['par_id'].astype(str).str.strip()
-    dev_ids['par_id']   = dev_ids['par_id'].astype(str).str.strip()
-    full_df['par_id']   = full_df['par_id'].astype(str).str.strip()
-
     train_df = full_df[full_df['par_id'].isin(train_ids['par_id'])].reset_index(drop=True)
-    # Preserve dev order to match predictions row-by-row
-    dev_df   = dev_ids[['par_id']].merge(full_df, on='par_id', how='left').reset_index(drop=True)
-    test_df  = dpm.test_set_df
+
+    # ── Dev: MUST use CSV vote labels in CSV order to match official scorer ───
+    dev_ids = pd.read_csv(os.path.join(DATA_DIR, 'dev_semeval_parids-labels.csv'))
+    dev_ids['par_id'] = dev_ids['par_id'].astype(str).str.strip()
+    # CSV vote binarization: >= 2 annotators marked PCL
+    dev_ids['binary_label'] = dev_ids['label'].apply(
+        lambda x: 1 if sum(ast.literal_eval(x)) >= 2 else 0
+    )
+
+    # Merge text in CSV order, then override label with CSV vote label
+    dev_df = dev_ids[['par_id', 'binary_label']].merge(
+        full_df[['par_id', 'text']], on='par_id', how='left'
+    ).reset_index(drop=True)
+    dev_df['label'] = dev_df['binary_label']
+
+    test_df = dpm.test_set_df
 
     print(f"Train: {len(train_df)} | Dev: {len(dev_df)} | Test: {len(test_df)}")
     print(f"Train PCL: {train_df['label'].sum()} ({train_df['label'].mean()*100:.1f}%)")
@@ -204,13 +206,11 @@ def train_epoch(model, loader, optimiser, scheduler, loss_fn, fgm, scaler):
         attention_mask = batch['attention_mask'].to(device)
         labels         = batch['labels'].to(device)
 
-        # Normal forward + backward (fp16)
         with torch.cuda.amp.autocast():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             loss    = loss_fn(outputs.logits, labels)
         scaler.scale(loss).backward()
 
-        # FGM adversarial pass (fp16)
         fgm.attack()
         with torch.cuda.amp.autocast():
             adv_outputs = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -316,7 +316,6 @@ def main():
     best_threshold = 0.5
     start_epoch    = 0
 
-    # Resume from checkpoint if one exists
     ckpt_path, last_epoch = find_latest_checkpoint()
     if ckpt_path:
         print(f"Resuming from checkpoint: {ckpt_path}")
@@ -347,7 +346,6 @@ def main():
             torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, 'best_model.pt'))
             print(f"Saved best model — F1: {best_f1:.4f} at threshold {best_threshold:.2f}")
 
-        # Log metrics
         metrics_row = {
             'epoch':         epoch + 1,
             'train_loss':    train_loss,
@@ -359,22 +357,18 @@ def main():
         write_header = not os.path.exists(METRICS_PATH)
         metrics_df.to_csv(METRICS_PATH, mode='a', header=write_header, index=False)
 
-        # Save single rolling checkpoint
         save_checkpoint(epoch + 1, model, optimiser, scheduler, scaler, best_f1, best_threshold)
 
     print(f"\nFinal best dev F1: {best_f1:.4f} at threshold {best_threshold:.2f}")
 
-    # Load best model and generate final predictions
     best_model_path = os.path.join(OUTPUT_DIR, 'best_model.pt')
     if not os.path.exists(best_model_path):
-        print("Warning: best_model.pt not found, saving current model state")
         torch.save(model.state_dict(), best_model_path)
     model.load_state_dict(torch.load(best_model_path))
 
     pred_dir = os.path.join(os.path.dirname(__file__), '..', 'predictions')
     os.makedirs(pred_dir, exist_ok=True)
 
-    # Dev predictions + raw probs for PR curve
     _, dev_probs, dev_labels = evaluate(model, dev_loader, threshold=best_threshold)
     dev_preds = (dev_probs >= best_threshold).astype(int)
     np.save(os.path.join(pred_dir, 'dev_probs.npy'), dev_probs)
@@ -385,7 +379,6 @@ def main():
     print(f"Saved dev.txt ({len(dev_preds)} predictions)")
     print(f"Saved dev_probs.npy ({len(dev_probs)} probabilities)")
 
-    # Test predictions
     test_preds = predict_test(model, test_loader, best_threshold)
     with open(os.path.join(pred_dir, 'test.txt'), 'w') as f:
         for p in test_preds:
