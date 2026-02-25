@@ -16,7 +16,7 @@ DATA_DIR        = os.path.join(BASE_DIR, "..", "data")
 PRED_DIR        = os.path.join(BASE_DIR, "..", "predictions")
 OUTPUT_DIR      = os.path.join(BASE_DIR, "..", "eda")
 BASELINE_F1     = 0.48          # RoBERTa baseline from the paper
-THRESHOLD       = 0.50          # nominal threshold used for plots
+THRESHOLD       = 0.12          # nominal threshold used for plots
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -72,7 +72,7 @@ def plot_confusion_matrix(dev_df, overall_f1):
 
     fig, ax = plt.subplots(figsize=(5, 4))
     disp.plot(ax=ax, colorbar=False, cmap="Blues")
-    ax.set_title("Confusion Matrix — DeBERTa-v3-base (dev set)", fontsize=11)
+    ax.set_title("Confusion Matrix — DeBERTa-v3-large (dev set)", fontsize=11)
     plt.tight_layout()
     out = os.path.join(OUTPUT_DIR, "confusion_matrix.png")
     plt.savefig(out, dpi=150)
@@ -101,7 +101,7 @@ def plot_pr_curve(dev_df):
         ap = average_precision_score(dev_df["binary_label"], probs)
 
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(recall, precision, lw=2, label=f"DeBERTa-v3-base (AP={ap:.3f})")
+        ax.plot(recall, precision, lw=2, label=f"DeBERTa-v3-large (AP={ap:.3f})")
 
         # Mark operating threshold
         idx = np.argmin(np.abs(thresholds - THRESHOLD))
@@ -162,7 +162,7 @@ def analyse_by_keyword(dev_df, overall_f1):
     ax.axvline(BASELINE_F1,  color="red",    lw=1.5, linestyle=":",
                label=f"Baseline F1={BASELINE_F1}")
     ax.set_xlabel("F1 Score (PCL class)")
-    ax.set_title("Per-Keyword F1 — DeBERTa-v3-base vs Baseline")
+    ax.set_title("Per-Keyword F1 — DeBERTa-v3-large vs Baseline")
     ax.legend(fontsize=8)
     plt.tight_layout()
     out = os.path.join(OUTPUT_DIR, "keyword_f1.png")
